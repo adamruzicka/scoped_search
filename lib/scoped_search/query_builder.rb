@@ -38,7 +38,9 @@ module ScopedSearch
 
     # Initializes the instance by setting the relevant parameters
     def initialize(definition, ast, profile)
-      @definition, @ast, @definition.profile = definition, ast, profile
+      @definition = definition
+      @ast = ast
+      @definition.profile = profile
     end
 
     # Actually builds the find parameters hash that should be used in the search_for
@@ -287,15 +289,20 @@ module ScopedSearch
       connection = many_class.connection
       sql = connection.quote_table_name(many_class.table_name)
       join_reflections = nested_has_many(many_class, field.relation)
-      table_names = [many_class.table_name] + join_reflections.map(&:table_name)
+      table_names = [[many_class.table_name, many_class.sti_name.tableize]] + join_reflections.map(&:table_name)
 
       join_reflections.zip(table_names.zip(join_reflections.drop(1))).reduce(sql) do |acc, (reflection, (previous_table, next_reflection))|
-        klass = reflection.method(:join_keys).arity == 1 ? [reflection.klass] : [] # ActiveRecord <5.2 workaround
-        fk1, pk1 = reflection.join_keys(*klass).values # We are joining the tables "in reverse", so the PK and FK are swapped
+        fk1, pk1 = if reflection.respond_to?(:join_keys)
+                     klass = reflection.method(:join_keys).arity == 1 ? [reflection.klass] : [] # ActiveRecord <5.2 workaround
+                     reflection.join_keys(*klass).values # We are joining the tables "in reverse", so the PK and FK are swapped
+                   else
+                     [reflection.join_primary_key, reflection.join_foreign_key] #ActiveRecord 6.1
+                   end
 
+        previous_table, sti_name = previous_table
         # primary and foreign keys + optional conditions for the joins
         join_condition = if with_polymorphism?(reflection)
-                           field.reflection_conditions(definition.reflection_by_name(next_reflection.klass, previous_table))
+                           field.reflection_conditions(definition.reflection_by_name(next_reflection.klass, sti_name || previous_table))
                          else
                            ''
                          end
@@ -443,7 +450,9 @@ module ScopedSearch
           field = definition.field_by_name(value)
           if field && field.set? && field.complete_value.values.include?(true)
             key = field.complete_value.map{|k,v| k if v == true}.compact.first
-            return builder.set_test(field, :eq, key, &block)
+            sql, *params = builder.set_test(field, :eq, key, &block)
+            params.each { |p| yield(:parameter, p) }
+            return sql
           end
           # Search keywords found without context, just search on all the default fields
           fragments = definition.default_fields_for(value).map do |field|
@@ -500,7 +509,7 @@ module ScopedSearch
           raise ScopedSearch::QueryNotSupported, "Field '#{lhs.value}' not recognized for searching!" unless field
 
           # see if the value passes user defined validation
-          if operator == :in
+          if [:in, :notin].include?(operator)
             rhs.value.split(',').each { |v| validate_value(field, v) }
           else
             validate_value(field, rhs.value)
